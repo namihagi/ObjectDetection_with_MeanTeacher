@@ -1,0 +1,16 @@
+.git/*
+.idea/*
+__pycache__/*
+datasets/*
+log/*
+checkpoint/*
+sample/*
+test/*
+sample.py
+config.json
+remove.sh
+
+src/__pycache__/*
+src/input_pipeline/__pycache__/*
+src/utils/__pycache__/*
+src/constants.py
