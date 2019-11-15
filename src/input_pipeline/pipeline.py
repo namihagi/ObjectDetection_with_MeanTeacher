@@ -55,8 +55,8 @@ class Pipeline:
         dataset = dataset.flat_map(tf.data.TFRecordDataset)
         dataset = dataset.prefetch(buffer_size=batch_size)
 
-        if shuffle:
-            dataset = dataset.shuffle(buffer_size=SHUFFLE_BUFFER_SIZE)
+        # if shuffle:
+        #     dataset = dataset.shuffle(buffer_size=SHUFFLE_BUFFER_SIZE)
         dataset = dataset.repeat(None if repeat else 1)
         dataset = dataset.map(self._parse_and_preprocess, num_parallel_calls=NUM_THREADS)
 
