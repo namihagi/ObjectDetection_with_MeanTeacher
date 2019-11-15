@@ -6,6 +6,7 @@ log/*
 checkpoint/*
 sample/*
 test/*
+result/*
 sample.py
 config.json
 remove.sh
