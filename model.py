@@ -4,11 +4,12 @@ import os
 import tensorflow as tf
 from tqdm import tqdm
 
-from src import FeatureExtractor, AnchorGenerator, Detector, GraphExtractor
+from src import FeatureExtractor, AnchorGenerator, Detector, GraphExtractor, makedirs
 from src.constants import PARALLEL_ITERATIONS
 from src.evaluation_numpy import EvaluatorNumpy
 from src.input_pipeline import Pipeline
 from src.input_pipeline.mean_teacher_pipeline import MeanTeacherPipeline
+from src.result_util import output_prediction
 
 CONFIG_PATH = 'config.json'
 
@@ -16,14 +17,22 @@ CONFIG_PATH = 'config.json'
 class Model(object):
     def __init__(self, sess, args):
         self.sess = sess
+        self.args = args
         # load parameters
         self.params = json.load(open(CONFIG_PATH))
         self.model_params = self.params['model_params']
         self.input_params = self.params['input_pipeline_params']
-        self.dir_params = self.params['directory_params']
+
+        # input parameters
+        self.gpu_num = args.gpu_num
+        self.batch_size = self.input_params['batch_size'][args.phase] * self.gpu_num
+        self.image_size = self.input_params['image_size']
 
         # FaceBoxes model parameters
         self.epoch_source_only = self.model_params['epoch_source_only']
+        self.source_max_iteration = int(self.model_params['source_max_iteration'] / self.gpu_num)
+        self.lr_boundaries = [int(self.model_params['lr_boundaries'][0] / self.gpu_num),
+                              int(self.model_params['lr_boundaries'][1] / self.gpu_num)]
         self.localization_loss_weight = self.model_params['localization_loss_weight']
         self.classification_loss_weight = self.model_params['classification_loss_weight']
         self.weight_decay = self.model_params['weight_decay']
@@ -35,29 +44,17 @@ class Model(object):
         self.score_threshold = self.model_params['confidence_threshold']
         self.alpha = self.model_params['smooth_param_of_ema']
 
-        # input parameters
-        self.gpu_num = args.gpu_num
-        if args.phase == 'pretrain':
-            self.batch_size = self.input_params['pretrain_batch_size'] * self.gpu_num
-        else:
-            self.batch_size = self.input_params['mt_batch_size'] * self.gpu_num
-        self.image_size = self.input_params['image_size']
-
         # directory setting
-        if args.phase == 'pretrain':
-            self.log_dir = os.path.join(self.dir_params['log_dir'], args.sub_dir, 'pretrain')
-        else:
-            self.log_dir = os.path.join(self.dir_params['log_dir'], args.sub_dir, 'train')
-        if not os.path.exists(self.log_dir):
-            os.makedirs(self.log_dir)
+        # log dir
+        self.log_dir = os.path.join(args.log_dir, args.sub_dir, 'pretrain') \
+            if args.phase == 'pretrain' else os.path.join(args.log_dir, args.sub_dir, 'train')
+        makedirs(self.log_dir)
 
-        self.pretrain_ckpt_dir = os.path.join(self.dir_params['checkpoint_dir'], args.pretrain_ckpt_dir)
-        # self.pretrain_ckpt_dir = os.path.join(self.dir_params['checkpoint_dir'], args.sub_dir, 'pretrain')
-        self.mt_ckpt_dir = os.path.join(self.dir_params['checkpoint_dir'], args.sub_dir, 'mean_teacher')
-        if not os.path.exists(self.pretrain_ckpt_dir):
-            os.makedirs(self.pretrain_ckpt_dir)
-        if not os.path.exists(self.mt_ckpt_dir):
-            os.makedirs(self.mt_ckpt_dir)
+        # checkpoint dir
+        self.pretrain_ckpt_dir = os.path.join(args.ckpt_dir, args.pretrain_ckpt_sub_dir)
+        self.mt_ckpt_dir = os.path.join(args.ckpt_dir, args.sub_dir)
+        makedirs(self.pretrain_ckpt_dir)
+        makedirs(self.mt_ckpt_dir)
 
         # build graph
         self._build_model()
@@ -87,7 +84,7 @@ class Model(object):
 
         # list to gather losses
         self.s_supervised_total_loss_list = []
-        self.losses_cons = []
+        self.consistency_loss_list = []
 
         # list to gather predictions
         self.s_prediction_list = []
@@ -164,23 +161,23 @@ class Model(object):
                         self.loss_EGL = tf.reduce_mean(tf.reduce_mean((self.s_AM - self.t_AM) ** 2, axis=(1, 2)))
 
                     with tf.name_scope('intrA-Graph-consistency-Loss'):
-                        self.loss_AGL = tf.reduce_mean(tf.reduce_mean((tf.ones_like(self.s_AM) - self.s_AM), axis=(1, 2)))
+                        self.loss_AGL = tf.reduce_mean(
+                            tf.reduce_mean((tf.ones_like(self.s_AM) - self.s_AM), axis=(1, 2)))
 
                     # total consistency loss
                     self.loss_cons = self.loss_RCL + self.loss_EGL + self.loss_AGL
-                    self.losses_cons.append(self.loss_cons)
+                    self.consistency_loss_list.append(self.loss_cons)
 
         # compute all loss over gpu
         self.s_total_loss = tf.reduce_mean(tf.stack(self.s_supervised_total_loss_list, axis=0))
-        self.total_cons_loss = tf.reduce_mean(tf.stack(self.losses_cons, axis=0))
+        self.total_cons_loss = tf.reduce_mean(tf.stack(self.consistency_loss_list, axis=0))
 
         # learning rate for supervised optimizer
         with tf.variable_scope('learning_rate'):
             self.global_step = tf.train.get_global_step()
             if self.global_step is None:
                 self.global_step = tf.train.create_global_step()
-            self.source_learning_rate = tf.train.piecewise_constant(self.global_step,
-                                                                    self.model_params['lr_boundaries'],
+            self.source_learning_rate = tf.train.piecewise_constant(self.global_step, self.lr_boundaries,
                                                                     self.model_params['lr_values'])
 
         # getting variables
@@ -205,18 +202,20 @@ class Model(object):
                       colocate_gradients_with_ops=True, var_list=self.student_vars)
 
         # summary
-        # regularization_loss_sum = tf.summary.scalar('regularization_loss', self.regularization_loss)
-        # s_localization_loss_sum = tf.summary.scalar('localization_loss', self.s_localization_loss)
-        # s_classification_loss_sum = tf.summary.scalar('classification_loss', self.s_classification_loss)
+        regularization_loss_sum = tf.summary.scalar('regularization_loss', self.regularization_loss)
+        s_localization_loss_sum = tf.summary.scalar('localization_loss', self.s_localization_loss)
+        s_classification_loss_sum = tf.summary.scalar('classification_loss', self.s_classification_loss)
         s_supervised_total_loss_sum = tf.summary.scalar('s_total_loss', self.s_total_loss)
         s_lr_sum = tf.summary.scalar('learning_rate', self.source_learning_rate)
-        self.merged_source_sum = tf.summary.merge([s_supervised_total_loss_sum, s_lr_sum])
+        self.merged_source_sum = tf.summary.merge([s_lr_sum, s_supervised_total_loss_sum, regularization_loss_sum,
+                                                   s_localization_loss_sum, s_classification_loss_sum])
 
-        # loss_RCL_sum = tf.summary.scalar('RCL_loss', self.loss_RCL)
-        # loss_EGL_sum = tf.summary.scalar('EGL_loss', self.loss_EGL)
-        # loss_AGL_sum = tf.summary.scalar('AGL_loss', self.loss_AGL)
+        loss_RCL_sum = tf.summary.scalar('RCL_loss', self.loss_RCL)
+        loss_EGL_sum = tf.summary.scalar('EGL_loss', self.loss_EGL)
+        loss_AGL_sum = tf.summary.scalar('AGL_loss', self.loss_AGL)
         total_cons_loss_sum = tf.summary.scalar('total_cons_loss', self.total_cons_loss)
-        self.merged_MT_sum = tf.summary.merge([s_supervised_total_loss_sum, total_cons_loss_sum])
+        self.merged_MT_sum = tf.summary.merge([loss_RCL_sum, loss_EGL_sum,
+                                               loss_AGL_sum, total_cons_loss_sum])
 
         # teacher weights update
         self.mt_initial_op = tf.group([tf.assign(t_var, s_var)
@@ -229,13 +228,13 @@ class Model(object):
         self.sess.run(init_op)
 
         # source training input
-        train_next_el, num_train_data = self.source_input_fn(is_training=True)
+        train_next_el = self.source_input_fn(is_training=True)
         # val_next_el, num_val_data = self.source_input_fn(is_training=False)
         # evaluator = EvaluatorNumpy()
 
         print('start pretraining')
         # pretrain source images
-        for idx in tqdm(range(self.epoch_source_only * num_train_data)):
+        for idx in tqdm(range(self.source_max_iteration)):
             images, boxes, num_boxes, filenames = self.sess.run(train_next_el)
             feed_dict = {
                 self.s_images: images,
@@ -249,8 +248,7 @@ class Model(object):
             #     self.val(evaluator, val_next_el, idx)
 
         # save pretrain model
-        global_index = self.epoch_source_only * num_train_data
-        self.save(step=global_index, is_pretrain=True, model_name='pretrain.model')
+        self.save(step=self.source_max_iteration, is_pretrain=True, model_name='pretrain.model')
         print(' [*] saved model')
 
     def train(self):
@@ -429,6 +427,62 @@ class Model(object):
         summary = self.sess.run(merged_val_sum)
         self.writer.add_summary(summary, global_step=step)
 
+    def pretrain_val(self, args):
+        init_op = tf.global_variables_initializer()
+        self.sess.run(init_op)
+
+        # pretraining model loading
+        if self.load(is_pretrain=True):
+            print(" [*] Load SUCCESS")
+        else:
+            assert False, " [!] Load failed..."
+
+        # source val input_pipeline
+        source_val_next_el = self.source_input_fn(is_training=False)
+        target_val_next_el = self.target_input_fn(is_training=False)
+        # evaluator
+        evaluator = EvaluatorNumpy()
+
+        # ----- source -----
+        try:
+            source_result_dir = os.path.join(args.result_dir, args.sub_dir, 'source_on_pretrain')
+            source_GT_result_dir = os.path.join(args.result_dir, args.sub_dir, 'source_GT_on_pretrain')
+            makedirs(source_result_dir)
+            makedirs(source_GT_result_dir)
+            while True:
+                images, boxes, num_boxes, filenames = self.sess.run(source_val_next_el)
+                feed_dict = {
+                    self.s_images: images,
+                    self.s_boxes: boxes,
+                    self.s_num_boxes: num_boxes,
+                }
+
+                prediction_list = self.sess.run(self.s_prediction_list, feed_dict=feed_dict)
+                output_prediction(prediction_list, boxes, num_boxes, filenames,
+                                  source_result_dir, source_GT_result_dir)
+        except Exception as E:
+            print(E)
+
+        # ----- target -----
+        try:
+            target_result_dir = os.path.join(args.result_dir, args.sub_dir, 'target_on_pretrain')
+            target_GT_result_dir = os.path.join(args.result_dir, args.sub_dir, 'target_GT_on_pretrain')
+            makedirs(target_result_dir)
+            makedirs(target_GT_result_dir)
+            while True:
+                images, boxes, num_boxes, filenames = self.sess.run(target_val_next_el)
+                feed_dict = {
+                    self.s_images: images,
+                    self.s_boxes: boxes,
+                    self.s_num_boxes: num_boxes,
+                }
+
+                prediction_list = self.sess.run(self.s_prediction_list, feed_dict=feed_dict)
+                output_prediction(prediction_list, boxes, num_boxes, filenames,
+                                  target_result_dir, target_GT_result_dir)
+        except Exception as E:
+            print(E)
+
     def save(self, step, is_pretrain=False, model_name=None):
         if model_name is None:
             model_name = "FaceBoxes_with_MT.model"
@@ -459,13 +513,14 @@ class Model(object):
     def source_input_fn(self, is_training=True):
         image_size = self.image_size if is_training else None
         # (for evaluation i use images of different sizes)
-        dataset_path = self.input_params['train_source_dataset'] \
-            if is_training else self.input_params['val_source_dataset']
-        batch_size = self.batch_size if is_training else 1
+
+        dataset_path = os.path.join(self.args.dataset_dir, self.args.source_dir, 'train') \
+            if is_training else os.path.join(self.args.dataset_dir, self.args.source_dir, 'val')
+
+        batch_size = self.batch_size
         # for evaluation it's important to set batch_size to 1
 
         filenames = os.listdir(dataset_path)
-        num_files = len(filenames)
         filenames = [n for n in filenames if n.endswith('.tfrecords')]
         filenames = [os.path.join(dataset_path, n) for n in sorted(filenames)]
 
@@ -473,22 +528,22 @@ class Model(object):
             pipeline = Pipeline(
                 filenames,
                 batch_size=batch_size, image_size=image_size,
-                repeat=True, shuffle=is_training,
+                repeat=is_training, shuffle=is_training,
                 augmentation=is_training
             )
             el = pipeline.get_batch()
-        return el, int(num_files / batch_size)
+        return el
 
     def target_input_fn(self, is_training=True):
         image_size = self.image_size if is_training else None
         # (for evaluation i use images of different sizes)
-        dataset_path = self.input_params['train_target_dataset'] \
-            if is_training else self.input_params['val_target_dataset']
-        batch_size = self.batch_size if is_training else 1
-        # for evaluation it's important to set batch_size to 1
+
+        dataset_path = os.path.join(self.args.dataset_dir, self.args.target_dir, 'train') \
+            if is_training else os.path.join(self.args.dataset_dir, self.args.target_dir, 'val')
+
+        batch_size = self.batch_size
 
         filenames = os.listdir(dataset_path)
-        num_files = len(filenames)
         filenames = [n for n in filenames if n.endswith('.tfrecords')]
         filenames = [os.path.join(dataset_path, n) for n in sorted(filenames)]
 
@@ -497,7 +552,7 @@ class Model(object):
                 pipeline = MeanTeacherPipeline(
                     filenames,
                     batch_size=batch_size, image_size=image_size,
-                    repeat=True, shuffle=is_training,
+                    repeat=is_training, shuffle=is_training,
                     augmentation=is_training
                 )
                 el = pipeline.get_batch()
@@ -505,11 +560,11 @@ class Model(object):
                 pipeline = Pipeline(
                     filenames,
                     batch_size=batch_size, image_size=image_size,
-                    repeat=True, shuffle=is_training,
+                    repeat=is_training, shuffle=is_training,
                     augmentation=is_training
                 )
                 el = pipeline.get_batch()
-        return el, int(num_files / batch_size)
+        return el
 
 
 def make_cosine_similarity_matrix(feature):

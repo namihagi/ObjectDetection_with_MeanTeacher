@@ -6,6 +6,7 @@ from src.constants import BATCH_NORM_MOMENTUM
 class FeatureExtractor:
     def __init__(self, is_training):
         self.is_training = is_training
+        self.features = None
 
     def __call__(self, images):
         """
@@ -52,6 +53,7 @@ class FeatureExtractor:
             x = inception_module(x, scope='inception1')
             x = inception_module(x, scope='inception2')
             x = inception_module(x, scope='inception3')
+            self.features = x
             features.append(x)  # scale 0
             x = slim.conv2d(x, 128, (1, 1), scope='conv3_1')
             x = slim.conv2d(x, 256, (3, 3), stride=2, scope='conv3_2')
@@ -62,10 +64,13 @@ class FeatureExtractor:
 
         return features
 
+    def get_feature_maps(self):
+        return self.features
+
 
 def preprocess(images):
     """Transform images before feeding them to the network."""
-    return (2.0*images) - 1.0
+    return (2.0 * images) - 1.0
 
 
 def inception_module(x, scope):
