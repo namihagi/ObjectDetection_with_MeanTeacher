@@ -1,4 +1,3 @@
-import json
 import os
 import shutil
 
@@ -7,11 +6,10 @@ import numpy as np
 import tensorflow as tf
 from tqdm import tqdm
 
-from src import FeatureExtractor, AnchorGenerator, Detector, GraphExtractor, makedirs
+from src import FeatureExtractor, AnchorGenerator, Detector, makedirs
 from src.constants import PARALLEL_ITERATIONS
 from src.evaluation_numpy import EvaluatorNumpy
 from src.input_pipeline import Pipeline
-from src.input_pipeline.mean_teacher_pipeline import MeanTeacherPipeline
 from src.result_util import output_prediction, output_feature_maps
 
 CONFIG_PATH = 'config.json'
@@ -70,7 +68,11 @@ class Model(object):
 
     def _build_model(self):
         # input placeholder
-        self.images = tf.placeholder(tf.float32, [self.batch_size, self.image_size, self.image_size, 3], name="images")
+        self.images = tf.placeholder(
+            tf.float32,
+            [self.batch_size, self.image_size, self.image_size, 3],
+            name="images"
+        )
         self.boxes = tf.placeholder(tf.float32, [self.batch_size, None, 4], name="boxes")
         self.num_boxes = tf.placeholder(tf.int32, [self.batch_size], name="num_boxes")
 
@@ -84,7 +86,7 @@ class Model(object):
             reuse = (gpu_id > 0)
             with tf.device(tf.DeviceSpec(device_type="GPU", device_index=gpu_id)):
                 with tf.variable_scope('detector', reuse=reuse):
-                    feature_extractor = FeatureExtractor(is_training=False)
+                    feature_extractor = FeatureExtractor(is_training=self.is_training)
                     anchor_generator = AnchorGenerator()
                     detector = Detector(images_per_gpu[gpu_id], feature_extractor, anchor_generator)
 
@@ -130,8 +132,10 @@ class Model(object):
         update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS, scope='detector')
         with tf.control_dependencies(update_ops):
             optimizer = tf.train.MomentumOptimizer(self.learning_rate, momentum=0.9, use_nesterov=True)
-            self.train_op = optimizer.minimize(self.total_loss, global_step=self.global_step,
-                                               colocate_gradients_with_ops=(self.gpu_num > 1), var_list=self.t_vars)
+            self.train_op = optimizer.minimize(
+                self.total_loss, global_step=self.global_step,
+                colocate_gradients_with_ops=(self.gpu_num > 1), var_list=self.t_vars
+            )
 
         # summary
         regularization_loss_sum = tf.summary.scalar('regularization_loss', self.total_r_loss)
@@ -139,119 +143,35 @@ class Model(object):
         s_classification_loss_sum = tf.summary.scalar('classification_loss', self.total_c_loss)
         s_supervised_total_loss_sum = tf.summary.scalar('total_loss', self.total_loss)
         s_lr_sum = tf.summary.scalar('learning_rate', self.learning_rate)
-        self.merged_source_sum = tf.summary.merge([s_lr_sum, s_supervised_total_loss_sum, regularization_loss_sum,
-                                                   s_localization_loss_sum, s_classification_loss_sum])
+        self.merged_source_sum = tf.summary.merge(
+            [s_lr_sum, s_supervised_total_loss_sum, regularization_loss_sum,
+             s_localization_loss_sum, s_classification_loss_sum]
+        )
 
     def train(self):
         # training input
-        train_next_el = self.source_input_fn(is_training=True)
+        init_op, next_el, num_files = self.get_input_op()
 
         print('start training')
         for idx_epoch in tqdm(range(self.epoch)):
-            # dataset iter init
+            self.sess.run(init_op)
             for idx_iter in tqdm(range(self.max_iter_per_epoch), leave=False):
-                images, boxes, num_boxes, filenames = self.sess.run(train_next_el)
+                images, boxes, num_boxes, filenames = self.sess.run(next_el)
                 feed_dict = {
                     self.images: images,
                     self.boxes: boxes,
                     self.num_boxes: num_boxes,
                 }
-                global_step, _, summary = self.sess.run([self.global_step, self.train_op, self.merged_source_sum],
-                                                        feed_dict=feed_dict)
+                global_step, _, summary = self.sess.run(
+                    [self.global_step, self.train_op, self.merged_source_sum],
+                    feed_dict=feed_dict
+                )
                 self.writer.add_summary(summary, int(global_step))
 
-        # save pretrain model
+        # save model
         self.save()
 
     def test(self, args):
-        init_op = tf.global_variables_initializer()
-        self.sess.run(init_op)
-
-        if args.source_only_test:
-            # source only training model loading
-            if self.load(is_pretrain=True):
-                print(" [*] Load SUCCESS")
-            else:
-                assert False, " [!] Load failed..."
-
-            # val input_pipeline
-            target_val_next_el, num_target_val_data = self.source_input_fn(is_training=False)
-            # target_val_next_el, num_target_val_data = self.target_input_fn(is_training=False)
-            print('num_val_source {}'.format(num_target_val_data))
-            # evaluator
-            evaluator = EvaluatorNumpy()
-
-            # ----- source only -----
-            total_ap_source_only = 0
-            for idx in tqdm(range(num_target_val_data)):
-                images, boxes, num_boxes, filenames = self.sess.run(target_val_next_el)
-                feed_dict = {
-                    self.images: images,
-                    self.boxes: boxes,
-                    self.num_boxes: num_boxes,
-                }
-
-                # prediction
-                prediction = self.detector.get_predictions(
-                    score_threshold=self.model_params['score_threshold'],
-                    iou_threshold=self.model_params['iou_threshold'],
-                    max_boxes=self.model_params['max_boxes']
-                )
-                prediction = self.sess.run(prediction, feed_dict=feed_dict)
-
-                # evaluation
-                val_labels = {'boxes': boxes, 'num_boxes': num_boxes}
-                eval_result = evaluator.get_metric(filenames, val_labels, prediction)
-
-                # sum ap
-                total_ap_source_only += eval_result['AP']
-            mAP_source_only = total_ap_source_only / num_target_val_data
-
-            print('mAP_source_only: {}'.format(mAP_source_only))
-
-        if args.MT_test:
-            # mean teacher training model loading
-            if self.load():
-                print(" [*] Load SUCCESS")
-            else:
-                assert False, " [!] Load failed..."
-
-            # val input_pipeline
-            # target_val_next_el, num_target_val_data = self.target_input_fn(is_training=False)
-            target_val_next_el, num_target_val_data = self.source_input_fn(is_training=False)
-            print('num_val_source {}'.format(num_target_val_data))
-            # evaluator
-            evaluator = EvaluatorNumpy()
-
-            # ----- mean teacher -----
-            total_ap_mean_teacher = 0
-            for idx in tqdm(range(num_target_val_data)):
-                images, boxes, num_boxes, filenames = self.sess.run(target_val_next_el)
-                feed_dict = {
-                    self.images: images,
-                    self.boxes: boxes,
-                    self.num_boxes: num_boxes,
-                }
-
-                # prediction
-                prediction = self.detector.get_predictions(
-                    score_threshold=self.model_params['score_threshold'],
-                    iou_threshold=self.model_params['iou_threshold'],
-                    max_boxes=self.model_params['max_boxes']
-                )
-                prediction = self.sess.run(prediction, feed_dict=feed_dict)
-
-                # evaluation
-                val_labels = {'boxes': boxes, 'num_boxes': num_boxes}
-                eval_result = evaluator.get_metric(filenames, val_labels, prediction)
-
-                # sum ap
-                total_ap_mean_teacher += eval_result['AP']
-            mAP_mean_teacher = total_ap_mean_teacher / num_target_val_data
-
-            print('mAP_mean_teacher: {}'.format(mAP_mean_teacher))
-
-    def val(self, args):
         if self.load(args.pretrain_ckpt_sub_dir):
             print(" [*] Success loading")
         else:
@@ -437,63 +357,17 @@ class Model(object):
         else:
             return False
 
-    def source_input_fn(self, is_training=True):
-        # image_size = self.image_size if is_training else None
-        image_size = self.image_size
-        # (for evaluation i use images of different sizes)
-
-        # dataset_path = os.path.join(self.args.dataset_dir, self.args.source_dir, 'train') \
-        #     if is_training else os.path.join(self.args.dataset_dir, self.args.source_dir, 'val')
-        dataset_path = os.path.join(self.args.dataset_dir, self.args.source_dir, 'val', 'shards')
-
-        batch_size = self.batch_size
-        # for evaluation it's important to set batch_size to 1
-
-        filenames = os.listdir(dataset_path)
+    def get_input_op(self):
+        filenames = os.listdir(self.dataset_path)
         filenames = [n for n in filenames if n.endswith('.tfrecords')]
-        filenames = [os.path.join(dataset_path, n) for n in sorted(filenames)]
+        filenames = [os.path.join(self.dataset_path, n) for n in sorted(filenames)]
 
         with tf.device('/cpu:0'), tf.name_scope('input_pipeline'):
             pipeline = Pipeline(
-                filenames,
-                batch_size=batch_size, image_size=image_size,
-                repeat=is_training, shuffle=is_training,
-                augmentation=is_training
+                filenames, batch_size=self.batch_size, image_size=self.image_size,
+                shuffle=self.is_training, augmentation=self.is_training
             )
-            el = pipeline.get_batch()
-        return el
-
-    def target_input_fn(self, is_training=True):
-        image_size = self.image_size if is_training else None
-        # (for evaluation i use images of different sizes)
-
-        dataset_path = os.path.join(self.args.dataset_dir, self.args.target_dir, 'train') \
-            if is_training else os.path.join(self.args.dataset_dir, self.args.target_dir, 'val')
-
-        batch_size = self.batch_size
-
-        filenames = os.listdir(dataset_path)
-        filenames = [n for n in filenames if n.endswith('.tfrecords')]
-        filenames = [os.path.join(dataset_path, n) for n in sorted(filenames)]
-
-        with tf.device('/cpu:0'), tf.name_scope('input_pipeline'):
-            if is_training:
-                pipeline = MeanTeacherPipeline(
-                    filenames,
-                    batch_size=batch_size, image_size=image_size,
-                    repeat=is_training, shuffle=is_training,
-                    augmentation=is_training
-                )
-                el = pipeline.get_batch()
-            else:
-                pipeline = Pipeline(
-                    filenames,
-                    batch_size=batch_size, image_size=image_size,
-                    repeat=is_training, shuffle=is_training,
-                    augmentation=is_training
-                )
-                el = pipeline.get_batch()
-        return el
+        return pipeline.get_init_op_and_next_el()
 
 
 def make_cosine_similarity_matrix(feature):

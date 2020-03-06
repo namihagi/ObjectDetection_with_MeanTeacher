@@ -1,39 +1,18 @@
 import tensorflow as tf
 
-from src.constants import SHUFFLE_BUFFER_SIZE, NUM_THREADS, RESIZE_METHOD
+from src.constants import NUM_THREADS, RESIZE_METHOD
 from src.input_pipeline.random_image_crop import random_image_crop
-from src.input_pipeline.other_augmentations import random_color_manipulations,\
+from src.input_pipeline.other_augmentations import random_color_manipulations, \
     random_flip_left_right, random_pixel_value_scale, random_jitter_boxes
 
 
 class Pipeline:
-    """Input pipeline for training or evaluating object detectors."""
-
-    def __init__(self, filenames, batch_size, image_size,
-                 repeat=False, shuffle=False, augmentation=False):
-        """
-        Note: when evaluating set batch_size to 1.
-        Arguments:
-            filenames: a list of strings, paths to tfrecords files.
-            batch_size: an integer.
-            image_size: a list with two integers [width, height] or None,
-                images of this size will be in a batch.
-                If value is None then images will not be resized.
-                In this case batch size must be 1.
-            repeat: a boolean, whether repeat indefinitely.
-            shuffle: whether to shuffle the dataset.
-            augmentation: whether to do data augmentation.
-        """
-        if image_size is not None:
-            self.image_width, self.image_height = image_size
-            self.resize = True
-        else:
-            assert batch_size == 1
-            self.image_width, self.image_height = None, None
-            self.resize = False
-
+    def __init__(self, filenames, batch_size, image_size, c_dim=3,
+                 shuffle=False, augmentation=False):
         self.augmentation = augmentation
         self.batch_size = batch_size
+        self.image_size = image_size
+        self.c_dim = c_dim
 
         def get_num_samples(filename):
             return sum(1 for _ in tf.python_io.tf_record_iterator(filename))
@@ -47,45 +26,27 @@ class Pipeline:
         assert self.num_examples > 0
 
         dataset = tf.data.Dataset.from_tensor_slices(filenames)
-        num_shards = len(filenames)
+        self.num_shards = len(filenames)
 
         if shuffle:
-            dataset = dataset.shuffle(buffer_size=num_shards)
+            dataset = dataset.shuffle(buffer_size=self.num_shards)
 
         dataset = dataset.flat_map(tf.data.TFRecordDataset)
-        dataset = dataset.prefetch(buffer_size=batch_size*2)
+        dataset = dataset.prefetch(buffer_size=batch_size * 2)
 
-        # if shuffle:
-        #     dataset = dataset.shuffle(buffer_size=SHUFFLE_BUFFER_SIZE)
-        dataset = dataset.repeat(None if repeat else 1)
         dataset = dataset.map(self._parse_and_preprocess, num_parallel_calls=NUM_THREADS)
 
         # we need batches of fixed size
-        padded_shapes = ([self.image_height, self.image_width, 3], [None, 4], [], [])
-        dataset = dataset.apply(
-           tf.contrib.data.padded_batch_and_drop_remainder(batch_size, padded_shapes)
-        )
+        padded_shapes = ([self.image_size, self.image_size, self.c_dim], [None, 4], [], [])
+        dataset = dataset.padded_batch(batch_size, padded_shapes, drop_remainder=True)
         dataset = dataset.prefetch(buffer_size=1)
 
-        self.iterator = dataset.make_one_shot_iterator()
+        self.iterator = dataset.make_initializable_iterator()
 
-    def get_batch(self):
-        """
-        Returns:
-            features: a dict with the following keys
-                'images': a float tensor with shape [batch_size, image_height, image_width, 3].
-                'filenames': a string tensor with shape [batch_size].
-            labels: a dict with the following keys
-                'boxes': a float tensor with shape [batch_size, max_num_boxes, 4].
-                'num_boxes': an int tensor with shape [batch_size].
-            where max_num_boxes = max(num_boxes).
-        """
-        # images, boxes, num_boxes, filenames = self.iterator.get_next()
-        # features = {'images': images, 'filenames': filenames}
-        # labels = {'boxes': boxes, 'num_boxes': num_boxes}
-        # return features, labels
-        el = self.iterator.get_next()
-        return el
+    def get_init_op_and_next_el(self):
+        init_op = self.iterator.initializer
+        next_el = self.iterator.get_next()
+        return init_op, next_el, self.num_shards
 
     def _parse_and_preprocess(self, example_proto):
         """What this function does:
@@ -110,8 +71,8 @@ class Pipeline:
 
         # get image
         image = tf.image.decode_jpeg(parsed_features['image'], channels=3)
-        image = tf.image.convert_image_dtype(image, tf.float32)
-        # now pixel values are scaled to [0, 1] range
+        image = tf.cast(image, tf.float32)
+        centering_image = image - tf.constant([123, 117, 104], dtype=tf.float32)
 
         # get groundtruth boxes, they must be in from-zero-to-one format
         boxes = tf.stack([
@@ -119,20 +80,20 @@ class Pipeline:
             parsed_features['ymax'], parsed_features['xmax']
         ], axis=1)
         boxes = tf.to_float(boxes)
-        # it is important to clip her
-        #         boxes = tf.clip_by_value(boxes, clip_value_min=0.0, clip_value_max=1.0)e!
+        # it is important to clip here!
+        boxes = tf.clip_by_value(boxes, clip_value_min=0.0, clip_value_max=1.0)
 
         if self.augmentation:
-            image, boxes = self._augmentation_fn(image, boxes)
+            output_image, boxes = self._augmentation_fn(centering_image, boxes)
         else:
-            image = tf.image.resize_images(
-                image, [self.image_height, self.image_width],
+            output_image = tf.image.resize_images(
+                centering_image, [self.image_size, self.image_size],
                 method=RESIZE_METHOD
-            ) if self.resize else image
+            )
 
         num_boxes = tf.to_int32(tf.shape(boxes)[0])
         filename = parsed_features['filename']
-        return image, boxes, num_boxes, filename
+        return output_image, boxes, num_boxes, filename
 
     def _augmentation_fn(self, image, boxes):
         # there are a lot of hyperparameters here,
@@ -146,9 +107,9 @@ class Pipeline:
             overlap_thresh=0.4
         )
         image = tf.image.resize_images(
-            image, [self.image_height, self.image_width],
+            image, [self.image_size, self.image_size],
             method=RESIZE_METHOD
-        ) if self.resize else image
+        )
         # if you do color augmentations before resizing, it will be very slow!
 
         image = random_color_manipulations(image, probability=0.45, grayscale_probability=0.05)
