@@ -20,296 +20,148 @@ CONFIG_PATH = 'config.json'
 class Model(object):
     def __init__(self, sess, args):
         self.sess = sess
-        self.args = args
-        # load parameters
-        self.params = json.load(open(CONFIG_PATH))
-        self.model_params = self.params['model_params']
-        self.input_params = self.params['input_pipeline_params']
-
-        # input parameters
+        self.is_training = (args.phase == 'train')
         self.gpu_num = args.gpu_num
-        self.batch_size = args.batch_size_per_gpu * self.gpu_num
-        self.image_size = self.input_params['image_size']
-
-        # FaceBoxes model parameters
-        self.epoch_source_only = self.model_params['epoch_source_only']
-        self.source_max_iteration = int(self.model_params['source_max_iteration'] / (self.batch_size / 16))
-        self.lr_boundaries = [int(self.model_params['lr_boundaries'][0] / self.gpu_num),
-                              int(self.model_params['lr_boundaries'][1] / self.gpu_num)]
-        self.localization_loss_weight = self.model_params['localization_loss_weight']
-        self.classification_loss_weight = self.model_params['classification_loss_weight']
-        self.weight_decay = self.model_params['weight_decay']
-
-        # mean teacher parameters
-        self.epoch_mean_teacher = self.model_params['epoch_mean_teacher']
-        self.mean_teacher_lr = self.model_params['mean_teacher_lr']
-        self.mt_lambda = self.model_params['mt_lambda']
-        self.score_threshold = self.model_params['confidence_threshold']
-        self.alpha = self.model_params['smooth_param_of_ema']
 
         # directory setting
-        # log dir
-        self.log_dir = os.path.join(args.log_dir, args.sub_dir, 'pretrain') \
-            if args.phase == 'pretrain' else os.path.join(args.log_dir, args.sub_dir, 'train')
-        makedirs(self.log_dir)
+        self.dataset_path = args.dataset_path
+        self.sub_dir = args.sub_dir
+        assert self.sub_dir is not None
+        self.result_dir = os.path.join('./result', args.sub_dir)
+        self.log_dir = os.path.join('./log', args.sub_dir)
+        self.checkpoint_dir = os.path.join('./checkpoint', args.sub_dir)
+        for dir_path in [self.result_dir, self.log_dir, self.checkpoint_dir]:
+            makedirs(path=dir_path)
 
-        # checkpoint dir
-        self.pretrain_ckpt_dir = os.path.join(args.ckpt_dir, args.pretrain_ckpt_sub_dir)
-        self.mt_ckpt_dir = os.path.join(args.ckpt_dir, args.sub_dir)
-        makedirs(self.pretrain_ckpt_dir)
-        makedirs(self.mt_ckpt_dir)
+        # input parameters
+        self.batch_size = args.batch_size
+        assert self.batch_size % self.gpu_num == 0
+        self.image_size = args.image_size
+
+        # parameters for model
+        self.epoch = args.epoch
+        assert self.epoch > 250
+        dataset_size = len(os.listdir(self.dataset_path))
+        self.max_iter_per_epoch = dataset_size // self.batch_size
+        self.lr_boundaries = [200 * self.max_iter_per_epoch, 250 * self.max_iter_per_epoch],
+        self.lr_values = [1e-3, 1e-4, 1e-5],
+        self.weight_decay = 5e-4,
+        self.l_loss_weight = 0.0
+        self.c_loss_weight = 1.0
+        self.ohem_params = {
+            "loss_to_use": "classification",
+            "loc_loss_weight": 0.0, "cls_loss_weight": 1.0,
+            "num_hard_examples": 500, "nms_threshold": 0.99,
+            "max_negatives_per_positive": 3.0, "min_negatives_per_image": 30,
+        }
+        # parameters for predictions
+        self.score_threshold = 0.3,
+        self.iou_threshold = 0.3,
+        self.max_boxes = 200,
 
         # build graph
         self._build_model()
+        init_op = tf.global_variables_initializer()
+        self.sess.run(init_op)
 
         # create writer and saver
         self.writer = tf.summary.FileWriter(self.log_dir, self.sess.graph)
         self.saver = tf.train.Saver()
 
     def _build_model(self):
-        # source input placeholder
-        self.s_images = tf.placeholder(tf.float32, [self.batch_size, None, None, 3], name="s_images")
-        self.s_boxes = tf.placeholder(tf.float32, [self.batch_size, None, 4], name="s_boxes")
-        self.s_num_boxes = tf.placeholder(tf.int32, [self.batch_size], name="s_num_boxes")
-        # divide source input
-        self.s_images_per_gpu = tf.split(self.s_images, self.gpu_num)
-        self.s_boxes_per_gpu = tf.split(self.s_boxes, self.gpu_num)
-        self.s_num_boxes_per_gpu = tf.split(self.s_num_boxes, self.gpu_num)
+        # input placeholder
+        self.images = tf.placeholder(tf.float32, [self.batch_size, self.image_size, self.image_size, 3], name="images")
+        self.boxes = tf.placeholder(tf.float32, [self.batch_size, None, 4], name="boxes")
+        self.num_boxes = tf.placeholder(tf.int32, [self.batch_size], name="num_boxes")
 
-        # target input placeholder
-        self.t_images = tf.placeholder(tf.float32, [self.batch_size, None, None, 3], name="t_images")
-        self.t_boxes = tf.placeholder(tf.float32, [self.batch_size, None, 4], name="t_boxes")
-        self.t_num_boxes = tf.placeholder(tf.int32, [self.batch_size], name="t_num_boxes")
-        # divide target input
-        self.t_images_per_gpu = tf.split(self.t_images, self.gpu_num)
-        self.t_boxes_per_gpu = tf.split(self.t_boxes, self.gpu_num)
-        self.t_num_boxes_per_gpu = tf.split(self.t_num_boxes, self.gpu_num)
-
-        # list to gather losses
-        # self.s_supervised_total_loss_list = []
-        self.consistency_loss_list = []
-
-        # list to gather predictions
-        self.s_prediction_list = []
+        # input split
+        images_per_gpu = tf.split(self.images, self.gpu_num)
+        boxes_per_gpu = tf.split(self.images, self.gpu_num)
+        num_boxes_per_gpu = tf.split(self.images, self.gpu_num)
 
         # each gpu model define
         for gpu_id in range(int(self.gpu_num)):
             reuse = (gpu_id > 0)
             with tf.device(tf.DeviceSpec(device_type="GPU", device_index=gpu_id)):
-                with tf.variable_scope(tf.get_variable_scope(), reuse=reuse):
-                    # student model
-                    with tf.variable_scope('student'):
-                        self.s_feature_extractor = FeatureExtractor(is_training=False)
-                        self.s_anchor_generator = AnchorGenerator()
-                        self.s_detector = Detector(self.s_images_per_gpu[gpu_id], self.s_feature_extractor,
-                                                   self.s_anchor_generator)
+                with tf.variable_scope('detector', reuse=reuse):
+                    feature_extractor = FeatureExtractor(is_training=False)
+                    anchor_generator = AnchorGenerator()
+                    detector = Detector(images_per_gpu[gpu_id], feature_extractor, anchor_generator)
 
-                        with tf.name_scope('weight_decay'):
-                            self.regularization_loss = add_weight_decay(self.weight_decay, scope='student')
+                    with tf.name_scope('weight_decay'):
+                        r_loss = add_weight_decay(self.weight_decay, scope='detector')
+                        tf.add_to_collection('r_loss', r_loss)
 
-                        with tf.name_scope('student_supervised_loss'):
-                            s_labels = {'boxes': self.s_boxes_per_gpu[gpu_id],
-                                        'num_boxes': self.s_num_boxes_per_gpu[gpu_id]}
-                            s_losses = self.s_detector.loss(s_labels, self.model_params)
-                            self.s_localization_loss = self.localization_loss_weight * s_losses['localization_loss']
-                            self.s_classification_loss = \
-                                self.classification_loss_weight * s_losses['classification_loss']
-                            self.s_supervised_total_loss = \
-                                self.s_localization_loss + self.s_classification_loss + self.regularization_loss
-                            # self.s_supervised_total_loss_list.append(self.s_supervised_total_loss)
-                            tf.add_to_collection('s_supervised_total_loss', self.s_supervised_total_loss)
+                    with tf.name_scope('loss'):
+                        labels = {'boxes': boxes_per_gpu[gpu_id], 'num_boxes': num_boxes_per_gpu[gpu_id]}
+                        losses = detector.loss(labels, self.ohem_params)
+                        l_loss = self.l_loss_weight * losses['localization_loss']
+                        c_loss = self.c_loss_weight * losses['classification_loss']
+                        total_loss_per_gpu = l_loss + c_loss + r_loss
+                        tf.add_to_collection('total_loss_per_gpu', total_loss_per_gpu)
+                        tf.add_to_collection('l_loss', l_loss)
+                        tf.add_to_collection('c_loss', c_loss)
 
-                        with tf.name_scope('student_prediction'):
-                            s_prediction = self.s_detector.get_predictions(
-                                score_threshold=self.model_params['score_threshold'],
-                                iou_threshold=self.model_params['iou_threshold'],
-                                max_boxes=self.model_params['max_boxes']
-                            )
-                            self.s_prediction_list.append(s_prediction)
+                    with tf.name_scope('prediction'):
+                        prediction = detector.get_predictions(
+                            score_threshold=self.score_threshold,
+                            iou_threshold=self.iou_threshold,
+                            max_boxes=self.max_boxes
+                        )
+                        tf.add_to_collection('prediction', prediction)
 
-                    # teacher model
-                    with tf.variable_scope('teacher'):
-                        self.t_feature_extractor = FeatureExtractor(is_training=False)
-                        self.t_anchor_generator = AnchorGenerator()
-                        self.t_detector = Detector(self.t_images_per_gpu[gpu_id], self.t_feature_extractor,
-                                                   self.t_anchor_generator)
+        self.total_loss = tf.reduce_mean(tf.get_collection('total_loss_per_gpu', scope='detector'))
+        self.total_r_loss = tf.reduce_mean(tf.get_collection('r_loss', scope='detector'))
+        self.total_l_loss = tf.reduce_mean(tf.get_collection('l_loss', scope='detector'))
+        self.total_c_loss = tf.reduce_mean(tf.get_collection('c_loss', scope='detector'))
+        self.total_loss = tf.get_collection('prediction', scope='detector')
 
-                    # extract graph for consistency loss
-                    self.s_class_pred = self.s_detector.get_class_prediction()
-                    self.s_boxes_pred = self.s_detector.get_box_prediction()
-                    self.t_class_pred = self.t_detector.get_class_prediction()
-                    self.t_boxes_pred = self.t_detector.get_box_prediction()
-                    self.s_selected_class, self.s_selected_boxes, self.t_selected_class, self.t_selected_boxes, _ \
-                        = GraphExtractor(self.s_class_pred, self.s_boxes_pred, self.t_class_pred, self.t_boxes_pred)
-
-                    with tf.name_scope('Region-level-Consistency-Loss'):
-                        self.s_graph, _, self.t_graph, _, num_boxes = \
-                            GraphExtractor(self.s_selected_class, self.s_selected_boxes, self.t_selected_class,
-                                           self.t_selected_boxes, iou_use=False, score_threshold=self.score_threshold)
-
-                        def RLC_fn(x):
-                            s_g, t_g, num_box = x
-                            return tf.reduce_mean((s_g[:num_box] - t_g[:num_box]) ** 2)
-
-                        self.loss_RCL_per_image = tf.map_fn(RLC_fn, [self.s_graph, self.t_graph, num_boxes],
-                                                            dtype=tf.float32, parallel_iterations=PARALLEL_ITERATIONS,
-                                                            back_prop=True, swap_memory=False, infer_shape=True)
-                        self.loss_RCL = tf.reduce_mean(self.loss_RCL_per_image)
-
-                    with tf.name_scope('intEr-Graph-consistency-Loss'):
-                        self.s_feat = tf.concat([self.s_selected_boxes,
-                                                 tf.expand_dims(self.s_selected_class, axis=2)], axis=2)
-                        self.t_feat = tf.concat([self.t_selected_boxes,
-                                                 tf.expand_dims(self.t_selected_class, axis=2)], axis=2)
-                        # make affinity matrix (cosine similarity)
-                        self.s_AM = make_cosine_similarity_matrix(self.s_feat)
-                        self.t_AM = make_cosine_similarity_matrix(self.t_feat)
-                        self.loss_EGL = tf.reduce_mean(tf.reduce_mean((self.s_AM - self.t_AM) ** 2, axis=(1, 2)))
-
-                    with tf.name_scope('intrA-Graph-consistency-Loss'):
-                        self.loss_AGL = tf.reduce_mean(
-                            tf.reduce_mean((tf.ones_like(self.s_AM) - self.s_AM), axis=(1, 2)))
-
-                    # total consistency loss
-                    self.loss_cons = self.loss_RCL + self.loss_EGL + self.loss_AGL
-                    self.consistency_loss_list.append(self.loss_cons)
-
-        # compute all loss over gpu
-        self.s_total_loss = tf.reduce_mean(tf.get_collection('s_supervised_total_loss'))
-        # self.s_total_loss = tf.reduce_mean(tf.stack(self.s_supervised_total_loss_list, axis=0))
-        self.total_cons_loss = tf.reduce_mean(tf.stack(self.consistency_loss_list, axis=0))
-
-        # learning rate for supervised optimizer
+        # learning rate
         with tf.variable_scope('learning_rate'):
-            self.global_step = tf.train.get_global_step()
-            if self.global_step is None:
-                self.global_step = tf.train.create_global_step()
-            self.source_learning_rate = tf.train.piecewise_constant(self.global_step, self.lr_boundaries,
-                                                                    self.model_params['lr_values'])
+            self.global_step = tf.train.get_or_create_global_step()
+            self.learning_rate = tf.train.piecewise_constant(self.global_step, self.lr_boundaries, self.lr_values)
 
         # getting variables
-        self.student_vars = tf.trainable_variables(scope='student')
-        self.teacher_vars = tf.trainable_variables(scope='teacher')
-        print('----- student model variables -----')
-        for var in self.student_vars:
-            print(var)
-        print('----- teacher model variables -----')
-        for var in self.teacher_vars:
+        self.t_vars = tf.trainable_variables(scope='detector')
+        print('----- detector variables -----')
+        for var in self.t_vars:
             print(var.name)
 
-        # this optimizer is used with only supervised training
-        update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS, scope='student')
+        update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS, scope='detector')
         with tf.control_dependencies(update_ops):
-            self.s_optim_with_supervision = \
-                tf.train.MomentumOptimizer(self.source_learning_rate, momentum=0.9, use_nesterov=True) \
-                    .minimize(self.s_total_loss, global_step=self.global_step,
-                              colocate_gradients_with_ops=True, var_list=self.student_vars)
-        # this optimizer is used with mean teacher training
-        self.mean_teacher_loss = self.mt_lambda * self.total_cons_loss
-        self.s_optim_with_MT = tf.train.MomentumOptimizer(self.mean_teacher_lr, momentum=0.9, use_nesterov=True) \
-            .minimize(self.mean_teacher_loss, global_step=self.global_step,
-                      colocate_gradients_with_ops=True, var_list=self.student_vars)
+            optimizer = tf.train.MomentumOptimizer(self.learning_rate, momentum=0.9, use_nesterov=True)
+            self.train_op = optimizer.minimize(self.total_loss, global_step=self.global_step,
+                                               colocate_gradients_with_ops=(self.gpu_num > 1), var_list=self.t_vars)
 
         # summary
-        regularization_loss_sum = tf.summary.scalar('regularization_loss', self.regularization_loss)
-        s_localization_loss_sum = tf.summary.scalar('localization_loss', self.s_localization_loss)
-        s_classification_loss_sum = tf.summary.scalar('classification_loss', self.s_classification_loss)
-        s_supervised_total_loss_sum = tf.summary.scalar('s_total_loss', self.s_total_loss)
-        s_lr_sum = tf.summary.scalar('learning_rate', self.source_learning_rate)
+        regularization_loss_sum = tf.summary.scalar('regularization_loss', self.total_r_loss)
+        s_localization_loss_sum = tf.summary.scalar('localization_loss', self.total_l_loss)
+        s_classification_loss_sum = tf.summary.scalar('classification_loss', self.total_c_loss)
+        s_supervised_total_loss_sum = tf.summary.scalar('total_loss', self.total_loss)
+        s_lr_sum = tf.summary.scalar('learning_rate', self.learning_rate)
         self.merged_source_sum = tf.summary.merge([s_lr_sum, s_supervised_total_loss_sum, regularization_loss_sum,
                                                    s_localization_loss_sum, s_classification_loss_sum])
 
-        loss_RCL_sum = tf.summary.scalar('RCL_loss', self.loss_RCL)
-        loss_EGL_sum = tf.summary.scalar('EGL_loss', self.loss_EGL)
-        loss_AGL_sum = tf.summary.scalar('AGL_loss', self.loss_AGL)
-        total_cons_loss_sum = tf.summary.scalar('total_cons_loss', self.total_cons_loss)
-        self.merged_MT_sum = tf.summary.merge([loss_RCL_sum, loss_EGL_sum,
-                                               loss_AGL_sum, total_cons_loss_sum])
-
-        # teacher weights update
-        self.mt_initial_op = tf.group([tf.assign(t_var, s_var)
-                                       for s_var, t_var in zip(self.student_vars, self.teacher_vars)])
-        self.mt_update_op = tf.group([tf.assign(t_var, self.alpha * t_var + (1. - self.alpha) * s_var)
-                                      for s_var, t_var in zip(self.student_vars, self.teacher_vars)])
-
-    def pretrain(self):
-        init_op = tf.global_variables_initializer()
-        self.sess.run(init_op)
-
-        # source training input
+    def train(self):
+        # training input
         train_next_el = self.source_input_fn(is_training=True)
-        # val_next_el, num_val_data = self.source_input_fn(is_training=False)
-        # evaluator = EvaluatorNumpy()
 
-        print('start pretraining')
-        # pretrain source images
-        for idx in tqdm(range(self.source_max_iteration)):
-            images, boxes, num_boxes, filenames = self.sess.run(train_next_el)
-            feed_dict = {
-                self.s_images: images,
-                self.s_boxes: boxes,
-                self.s_num_boxes: num_boxes,
-            }
-            _, summary = self.sess.run([self.s_optim_with_supervision, self.merged_source_sum], feed_dict=feed_dict)
-            self.writer.add_summary(summary, idx)
+        print('start training')
+        for idx_epoch in tqdm(range(self.epoch)):
+            # dataset iter init
+            for idx_iter in tqdm(range(self.max_iter_per_epoch), leave=False):
+                images, boxes, num_boxes, filenames = self.sess.run(train_next_el)
+                feed_dict = {
+                    self.images: images,
+                    self.boxes: boxes,
+                    self.num_boxes: num_boxes,
+                }
+                global_step, _, summary = self.sess.run([self.global_step, self.train_op, self.merged_source_sum],
+                                                        feed_dict=feed_dict)
+                self.writer.add_summary(summary, int(global_step))
 
         # save pretrain model
-        self.save(step=self.source_max_iteration, is_pretrain=True, model_name='pretrain.model')
-        print(' [*] saved model')
-
-    def train(self):
-        init_op = tf.global_variables_initializer()
-        self.sess.run(init_op)
-
-        if self.load(is_pretrain=True):
-            print(" [*] Load SUCCESS")
-        else:
-            assert False, " [!] Load failed..."
-
-        # mean teacher training input
-        source_train_next_el, num_source_train_data = self.source_input_fn(is_training=True)
-        target_train_next_el, num_target_train_data = self.target_input_fn(is_training=True)
-        # target_val_next_el, num_target_val_data = self.target_input_fn(is_training=False)
-        # evaluator = EvaluatorNumpy()
-
-        # initialize teacher weights
-        self.sess.run(self.mt_initial_op)
-
-        global_step = num_source_train_data + self.epoch_source_only
-        num_step = num_target_train_data * self.epoch_mean_teacher
-        for idx in tqdm(range(num_step)):
-            # supervised update
-            images, boxes, num_boxes, filenames = self.sess.run(source_train_next_el)
-            feed_dict = {
-                self.s_images: images,
-                self.s_boxes: boxes,
-                self.s_num_boxes: num_boxes,
-            }
-            _, summary = self.sess.run([self.s_optim_with_supervision, self.merged_source_sum], feed_dict=feed_dict)
-            self.writer.add_summary(summary, global_step + idx)
-
-            # unsupervised update
-            images, boxes, num_boxes, filenames = self.sess.run(target_train_next_el)
-            feed_dict = {
-                self.s_images: images[:, 0, :],
-                self.s_boxes: boxes[:, 0, :],
-                self.s_num_boxes: num_boxes,
-                self.t_images: images[:, 1, :],
-                self.t_boxes: boxes[:, 1, :],
-                self.t_num_boxes: num_boxes,
-            }
-            _, summary = self.sess.run([self.s_optim_with_MT, self.merged_MT_sum], feed_dict=feed_dict)
-            self.writer.add_summary(summary, global_step + idx)
-
-            # teacher weights update
-            self.sess.run(self.mt_update_op)
-
-            # if idx + 1 % 500 == 0:
-            #     self.val(evaluator, target_val_next_el, global_step + idx)
-
-        # save mean teacher model
-        self.save(step=num_step, is_pretrain=False, model_name='MeanTeacher.model')
-        print(' [*] saved model')
+        self.save()
 
     def test(self, args):
         init_op = tf.global_variables_initializer()
@@ -334,13 +186,13 @@ class Model(object):
             for idx in tqdm(range(num_target_val_data)):
                 images, boxes, num_boxes, filenames = self.sess.run(target_val_next_el)
                 feed_dict = {
-                    self.s_images: images,
-                    self.s_boxes: boxes,
-                    self.s_num_boxes: num_boxes,
+                    self.images: images,
+                    self.boxes: boxes,
+                    self.num_boxes: num_boxes,
                 }
 
                 # prediction
-                prediction = self.s_detector.get_predictions(
+                prediction = self.detector.get_predictions(
                     score_threshold=self.model_params['score_threshold'],
                     iou_threshold=self.model_params['iou_threshold'],
                     max_boxes=self.model_params['max_boxes']
@@ -376,13 +228,13 @@ class Model(object):
             for idx in tqdm(range(num_target_val_data)):
                 images, boxes, num_boxes, filenames = self.sess.run(target_val_next_el)
                 feed_dict = {
-                    self.s_images: images,
-                    self.s_boxes: boxes,
-                    self.s_num_boxes: num_boxes,
+                    self.images: images,
+                    self.boxes: boxes,
+                    self.num_boxes: num_boxes,
                 }
 
                 # prediction
-                prediction = self.s_detector.get_predictions(
+                prediction = self.detector.get_predictions(
                     score_threshold=self.model_params['score_threshold'],
                     iou_threshold=self.model_params['iou_threshold'],
                     max_boxes=self.model_params['max_boxes']
@@ -455,7 +307,7 @@ class Model(object):
             # now pixel values are scaled to [0, 1] range
             image = np.expand_dims(image, 0)
             # prediction
-            predictions = self.sess.run(self.s_prediction_list, feed_dict={self.s_images: image})
+            predictions = self.sess.run(self.prediction_list, feed_dict={self.images: image})
             # extract prediction
             num_boxes = predictions[0]['num_boxes'][0]
             boxes = predictions[0]['boxes'][0][:num_boxes]
@@ -511,38 +363,17 @@ class Model(object):
             while tqdm(True):
                 images, boxes, num_boxes, filenames = self.sess.run(source_val_next_el)
                 feed_dict = {
-                    self.s_images: images,
-                    self.s_boxes: boxes,
-                    self.s_num_boxes: num_boxes,
+                    self.images: images,
+                    self.boxes: boxes,
+                    self.num_boxes: num_boxes,
                 }
 
-                prediction_list = self.sess.run(self.s_prediction_list, feed_dict=feed_dict)
+                prediction_list = self.sess.run(self.prediction_list, feed_dict=feed_dict)
                 output_prediction(prediction_list, boxes, num_boxes, filenames,
                                   source_result_dir, source_GT_result_dir)
         except Exception as E:
             print('finished validating source images')
             print('exception: {}'.format(E))
-
-        # # ----- target -----
-        # try:
-        #     target_result_dir = os.path.join(args.result_dir, args.sub_dir, 'target_on_pretrain')
-        #     target_GT_result_dir = os.path.join(args.result_dir, args.sub_dir, 'target_GT_on_pretrain')
-        #     makedirs(target_result_dir)
-        #     makedirs(target_GT_result_dir)
-        #     while tqdm(True):
-        #         images, boxes, num_boxes, filenames = self.sess.run(target_val_next_el)
-        #         feed_dict = {
-        #             self.s_images: images,
-        #             self.s_boxes: boxes,
-        #             self.s_num_boxes: num_boxes,
-        #         }
-        #
-        #         prediction_list = self.sess.run(self.s_prediction_list, feed_dict=feed_dict)
-        #         output_prediction(prediction_list, boxes, num_boxes, filenames,
-        #                           target_result_dir, target_GT_result_dir)
-        # except Exception as E:
-        #     print('finished validating target images')
-        #     print('exception: {}'.format(E))
 
     def get_feature_maps(self, args):
         init_op = tf.global_variables_initializer()
@@ -569,12 +400,12 @@ class Model(object):
             while True:
                 images, boxes, num_boxes, filenames = self.sess.run(source_val_next_el)
                 feed_dict = {
-                    self.s_images: images,
-                    self.s_boxes: boxes,
-                    self.s_num_boxes: num_boxes,
+                    self.images: images,
+                    self.boxes: boxes,
+                    self.num_boxes: num_boxes,
                 }
 
-                feature_maps = self.sess.run(self.s_detector.get_feature_maps(), feed_dict=feed_dict)
+                feature_maps = self.sess.run(self.detector.get_feature_maps(), feed_dict=feed_dict)
                 output_feature_maps(feature_maps, filenames, source_result_dir)
                 cnt += 1
                 print('\r%d' % cnt, end='')
@@ -582,15 +413,12 @@ class Model(object):
             print('\nfinished saving feature_maps as npy file.')
             print('exception: {}'.format(E))
 
-    def save(self, step, is_pretrain=False, model_name=None):
+    def save(self, model_name=None):
         if model_name is None:
-            model_name = "FaceBoxes_with_MT.model"
+            model_name = "FaceBoxes.model"
 
-        checkpoint_dir = self.pretrain_ckpt_dir if is_pretrain else self.mt_ckpt_dir
-        if not os.path.exists(checkpoint_dir):
-            os.makedirs(checkpoint_dir)
-
-        self.saver.save(self.sess, os.path.join(checkpoint_dir, model_name), global_step=step)
+        self.saver.save(self.sess, os.path.join(self.checkpoint_dir, model_name))
+        print(' [*] saved model')
 
     def load(self, is_pretrain=False, model_name=None):
         print(" [*] Reading checkpoint...")
