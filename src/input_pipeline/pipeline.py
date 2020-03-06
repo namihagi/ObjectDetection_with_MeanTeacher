@@ -53,7 +53,7 @@ class Pipeline:
             dataset = dataset.shuffle(buffer_size=num_shards)
 
         dataset = dataset.flat_map(tf.data.TFRecordDataset)
-        dataset = dataset.prefetch(buffer_size=batch_size)
+        dataset = dataset.prefetch(buffer_size=batch_size*2)
 
         # if shuffle:
         #     dataset = dataset.shuffle(buffer_size=SHUFFLE_BUFFER_SIZE)
@@ -119,8 +119,8 @@ class Pipeline:
             parsed_features['ymax'], parsed_features['xmax']
         ], axis=1)
         boxes = tf.to_float(boxes)
-        # it is important to clip here!
-        boxes = tf.clip_by_value(boxes, clip_value_min=0.0, clip_value_max=1.0)
+        # it is important to clip her
+        #         boxes = tf.clip_by_value(boxes, clip_value_min=0.0, clip_value_max=1.0)e!
 
         if self.augmentation:
             image, boxes = self._augmentation_fn(image, boxes)

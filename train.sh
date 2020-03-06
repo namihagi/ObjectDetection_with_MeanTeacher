@@ -1,41 +1,47 @@
-#!/bin bash
+#!/bin/bash
 
-# source model training
-#python3 main.py --phase pretrain --sub_dir pretrain_face --gpu_num=8
+## source model training
+#CUDA_VISIBLE_DEVICES=0 python3 main.py \
+#  --phase pretrain \
+#  --sub_dir pretrain_face_batch_norm \
+#  --pretrain_ckpt_sub_dir pretrain_face_batch_norm \
+#  --gpu_num 1 \
+#  --batch_size_per_gpu 16
 
 ## both models training
 #python3 main.py --phase train --sub_dir sim2city_3 --gpu_num=4
 
-## test
-#python3 main.py --phase test --sub_dir pretrain_face --source_only_test True --MT_test True
-
-## gpu04
-#python3 main.py \
-#          --phase pretrain \
-#          --gpu_num=4 \
-#          --sub_dir pretrain_face_gpu_4 \
-#          --pretrain_ckpt_sub_dir pretrain_face_gpu_4 \
-#          --source_dir face \
-#          --source_dir ball
-
-# gpu11
+# FDDB val
 python3 main.py \
-          --phase pretrain \
-          --gpu_num=1 \
-          --sub_dir pretrain_face_gpu_1 \
-          --pretrain_ckpt_sub_dir pretrain_face_gpu_1 \
-          --source_dir face \
-          --source_dir ball
+  --phase val \
+  --source_only_test True \
+  --sub_dir mange_image \
+  --gpu_num 1 \
+  --batch_size_per_gpu 1 \
+  --pretrain_ckpt_sub_dir pretrain_face_batch_norm \
+  --result_dir FDDB_val \
+  --source_dir face \
+  --target_dir ball
 
-## gpu15
+## test
 #python3 main.py \
-#          --phase pretrain \
-#          --gpu_num=8 \
-#          --sub_dir pretrain_face_gpu_8 \
-#          --pretrain_ckpt_sub_dir pretrain_face_gpu_8 \
-#          --source_dir face \
-#          --source_dir ball
+#  --phase test \
+#  --source_only_test True \
+#  --sub_dir mange_image \
+#  --gpu_num 1 \
+#  --batch_size_per_gpu 1 \
+#  --pretrain_ckpt_sub_dir pretrain_face_batch_norm \
+#  --result_dir ./result/lfw \
+#  --source_dir lfw \
+#  --target_dir ball
 
-
-
-
+## get feature maps
+#python3 main.py \
+#          --phase get_feature_maps \
+#          --gpu_num 1 \
+#          --batch_size_per_gpu 1 \
+#          --sub_dir test \
+#          --pretrain_ckpt_sub_dir pretrain_face_batch_norm \
+#          --result_dir ./result/lfw \
+#          --source_dir lfw \
+#          --target_dir ball

@@ -1,4 +1,3 @@
 #!/bin bash
 
-docker run --runtime=nvidia -it --rm -p 6060:6060 -v /disk011/usrs/hagio:/hagio nh122112/tensorflow:1.12.1
-#docker run --runtime=nvidia -it --rm -p 6060:6060 -v /disk011/usrs/hagio:/hagio nh122112/tensorflow:1.13.2.00
+docker run --runtime=nvidia -it --rm -v /disk018/usrs/hagio:/hagio nh122112/tensorflow:stylegan_4

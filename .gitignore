@@ -15,3 +15,5 @@ src/__pycache__/*
 src/input_pipeline/__pycache__/*
 src/utils/__pycache__/*
 src/constants.py
+box_result/*
+evaluation/*

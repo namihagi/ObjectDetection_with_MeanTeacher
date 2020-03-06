@@ -7,8 +7,12 @@ from model import Model
 parser = argparse.ArgumentParser(description='')
 
 # main setting
-parser.add_argument('--phase', dest='phase', default='train', help='train, test or pretrain')
+parser.add_argument('--phase', dest='phase', default='train', help='train, test, pretrain_val or pretrain')
 parser.add_argument('--gpu_num', dest='gpu_num', type=int, default=1, help='the number of gpu you use')
+
+# batch_size
+parser.add_argument('--batch_size_per_gpu', dest='batch_size_per_gpu',
+                    type=int, default=1, help='the number of images in batch')
 
 # test setting
 parser.add_argument('--source_only_test', dest='source_only_test', type=bool, default=False, help='pretrain test')
@@ -56,9 +60,15 @@ def main(_):
             model.pretrain()
         elif args.phase == 'train':
             model.train()
+        elif args.phase == 'pretrain_val':
+            model.pretrain_val(args)
         elif args.phase == 'test':
             assert args.source_only_test or args.MT_test, "you should set True on either source_only_test or MT_test."
             model.test(args)
+        elif args.phase == 'get_feature_maps':
+            model.get_feature_maps(args)
+        elif args.phase == 'val':
+            model.val(args)
 
 
 if __name__ == '__main__':
