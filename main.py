@@ -10,35 +10,14 @@ parser = argparse.ArgumentParser(description='')
 parser.add_argument('--phase', dest='phase', default='train', help='train, test, pretrain_val or pretrain')
 parser.add_argument('--gpu_num', dest='gpu_num', type=int, default=1, help='the number of gpu you use')
 
-# batch_size
-parser.add_argument('--batch_size_per_gpu', dest='batch_size_per_gpu',
-                    type=int, default=1, help='the number of images in batch')
+# model setting
+parser.add_argument('--batch_size', dest='batch_size', type=int, default=32, help='the number of images in batch')
+parser.add_argument('--epoch', dest='epoch', type=int, default=300, help='how many times you repeat dataset')
+parser.add_argument('--image_size', dest='image_size', type=int, default=1024, help='load size of image')
 
-# test setting
-parser.add_argument('--source_only_test', dest='source_only_test', type=bool, default=False, help='pretrain test')
-parser.add_argument('--MT_test', dest='MT_test', type=bool, default=False, help='mean teacher test')
-
-# output dir setting
-parser.add_argument('--sub_dir', dest='sub_dir', help='sub directory name')
-parser.add_argument('--pretrain_ckpt_sub_dir', dest='pretrain_ckpt_sub_dir', type=str,
-                    default='face-pretrain', help='pretrain sub dir name')
-parser.add_argument('--ckpt_dir', dest='ckpt_dir', default='./checkpoint', type=str, help='ckpt_dir name')
-parser.add_argument('--log_dir', dest='log_dir', default='./log', type=str, help='log_dir name')
-parser.add_argument('--result_dir', dest='result_dir', default='./result', type=str, help='result_dir name')
-
-# dataset dir setting
-parser.add_argument('--dataset_dir', dest='dataset_dir', default='./datasets', type=str, help='dataset dir')
-parser.add_argument('--source_dir', dest='source_dir', default='face', type=str, help='source dataset dir')
-parser.add_argument('--target_dir', dest='target_dir', default='ball', type=str, help='target dataset dir')
-
-# <dataset tree>
-# [root_dir]/datasets
-#             |-- [source_dir]/
-#             |       |-- train/
-#             |       |-- val/
-#             | -- [target_dir]/
-#             |       | -- train/
-#             |       | -- val/
+# dir setting
+parser.add_argument('--dataset_path', dest='dataset_path', type=str, help='path to dataset shards directory')
+parser.add_argument('--sub_dir', dest='sub_dir', type=str, help='sub directory name')
 
 args = parser.parse_args()
 
@@ -56,19 +35,24 @@ def main(_):
 
     with tf.Session(config=tfconfig) as sess:
         model = Model(sess, args)
-        if args.phase == 'pretrain':
-            model.pretrain()
-        elif args.phase == 'train':
+        if args.phase == 'train':
             model.train()
-        elif args.phase == 'pretrain_val':
-            model.pretrain_val(args)
         elif args.phase == 'test':
-            assert args.source_only_test or args.MT_test, "you should set True on either source_only_test or MT_test."
-            model.test(args)
-        elif args.phase == 'get_feature_maps':
-            model.get_feature_maps(args)
-        elif args.phase == 'val':
-            model.val(args)
+            model.test()
+
+        # if args.phase == 'pretrain':
+        #     model.pretrain()
+        # elif args.phase == 'train':
+        #     model.train()
+        # elif args.phase == 'pretrain_val':
+        #     model.pretrain_val(args)
+        # elif args.phase == 'test':
+        #     assert args.source_only_test or args.MT_test, "you should set True on either source_only_test or MT_test."
+        #     model.test(args)
+        # elif args.phase == 'get_feature_maps':
+        #     model.get_feature_maps(args)
+        # elif args.phase == 'val':
+        #     model.val(args)
 
 
 if __name__ == '__main__':

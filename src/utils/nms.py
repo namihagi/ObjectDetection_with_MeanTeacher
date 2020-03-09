@@ -50,4 +50,3 @@ def batch_non_max_suppression(
         back_prop=False, swap_memory=False, infer_shape=True
     )
     return boxes, scores, num_detections
-

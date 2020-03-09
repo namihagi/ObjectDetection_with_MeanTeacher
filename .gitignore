@@ -7,6 +7,9 @@ evaluation
 log
 result
 
-sample.py
 config.json
+sample.py
 sample.sh
+train.sh
+create_tfrecords.sh
+train_input_feature.sh

@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 
@@ -8,11 +9,7 @@ from tqdm import tqdm
 
 from src import FeatureExtractor, AnchorGenerator, Detector, makedirs
 from src.constants import PARALLEL_ITERATIONS
-from src.evaluation_numpy import EvaluatorNumpy
 from src.input_pipeline import Pipeline
-from src.result_util import output_prediction, output_feature_maps
-
-CONFIG_PATH = 'config.json'
 
 
 class Model(object):
@@ -41,10 +38,10 @@ class Model(object):
         assert self.epoch > 250
         dataset_size = len(os.listdir(self.dataset_path))
         self.max_iter_per_epoch = dataset_size // self.batch_size
-        self.lr_boundaries = [200 * self.max_iter_per_epoch, 250 * self.max_iter_per_epoch],
-        self.lr_values = [1e-3, 1e-4, 1e-5],
-        self.weight_decay = 5e-4,
-        self.l_loss_weight = 0.0
+        self.lr_boundaries = [200 * self.max_iter_per_epoch, 250 * self.max_iter_per_epoch]
+        self.lr_values = [1e-3, 1e-4, 1e-5]
+        self.weight_decay = 5e-4
+        self.l_loss_weight = 2.0
         self.c_loss_weight = 1.0
         self.ohem_params = {
             "loss_to_use": "classification",
@@ -53,12 +50,15 @@ class Model(object):
             "max_negatives_per_positive": 3.0, "min_negatives_per_image": 30,
         }
         # parameters for predictions
-        self.score_threshold = 0.3,
-        self.iou_threshold = 0.3,
-        self.max_boxes = 200,
+        self.score_threshold = 0.05
+        self.iou_threshold = 0.3
+        self.max_boxes = 200
 
         # build graph
-        self._build_model()
+        if self.is_training:
+            self._train_model()
+        else:
+            self._test_model()
         init_op = tf.global_variables_initializer()
         self.sess.run(init_op)
 
@@ -66,7 +66,7 @@ class Model(object):
         self.writer = tf.summary.FileWriter(self.log_dir, self.sess.graph)
         self.saver = tf.train.Saver()
 
-    def _build_model(self):
+    def _train_model(self):
         # input placeholder
         self.images = tf.placeholder(
             tf.float32,
@@ -78,8 +78,8 @@ class Model(object):
 
         # input split
         images_per_gpu = tf.split(self.images, self.gpu_num)
-        boxes_per_gpu = tf.split(self.images, self.gpu_num)
-        num_boxes_per_gpu = tf.split(self.images, self.gpu_num)
+        boxes_per_gpu = tf.split(self.boxes, self.gpu_num)
+        num_boxes_per_gpu = tf.split(self.num_boxes, self.gpu_num)
 
         # each gpu model define
         for gpu_id in range(int(self.gpu_num)):
@@ -104,19 +104,10 @@ class Model(object):
                         tf.add_to_collection('l_loss', l_loss)
                         tf.add_to_collection('c_loss', c_loss)
 
-                    with tf.name_scope('prediction'):
-                        prediction = detector.get_predictions(
-                            score_threshold=self.score_threshold,
-                            iou_threshold=self.iou_threshold,
-                            max_boxes=self.max_boxes
-                        )
-                        tf.add_to_collection('prediction', prediction)
-
         self.total_loss = tf.reduce_mean(tf.get_collection('total_loss_per_gpu', scope='detector'))
         self.total_r_loss = tf.reduce_mean(tf.get_collection('r_loss', scope='detector'))
         self.total_l_loss = tf.reduce_mean(tf.get_collection('l_loss', scope='detector'))
         self.total_c_loss = tf.reduce_mean(tf.get_collection('c_loss', scope='detector'))
-        self.total_loss = tf.get_collection('prediction', scope='detector')
 
         # learning rate
         with tf.variable_scope('learning_rate'):
@@ -149,6 +140,8 @@ class Model(object):
         )
 
     def train(self):
+        # save config
+        self.save_config()
         # training input
         init_op, next_el, num_files = self.get_input_op()
 
@@ -171,15 +164,35 @@ class Model(object):
         # save model
         self.save()
 
-    def test(self, args):
-        if self.load(args.pretrain_ckpt_sub_dir):
+    def _test_model(self):
+        # input placeholder
+        self.images = tf.placeholder(
+            tf.float32,
+            [self.batch_size, None, None, 3],
+            name="images"
+        )
+
+        with tf.variable_scope('detector'):
+            feature_extractor = FeatureExtractor(is_training=self.is_training)
+            anchor_generator = AnchorGenerator()
+            detector = Detector(self.images, feature_extractor, anchor_generator)
+
+            with tf.name_scope('prediction'):
+                self.prediction = detector.get_predictions(
+                    score_threshold=self.score_threshold,
+                    iou_threshold=self.iou_threshold,
+                    max_boxes=self.max_boxes
+                )
+
+    def test(self):
+        if self.load():
             print(" [*] Success loading")
         else:
             print(" [*] Failed loading")
 
         IMAGES_DIR = './datasets/FDDB/originalPics/'
         ANNOTATIONS_PATH = './datasets/FDDB/FDDB-folds/'
-        RESULT_DIR = args.result_dir
+        RESULT_DIR = self.result_dir
         if not os.path.exists(RESULT_DIR):
             os.makedirs(RESULT_DIR)
 
@@ -221,24 +234,24 @@ class Model(object):
             image_array = cv2.cvtColor(image_array, cv2.COLOR_BGR2RGB)
             # preprocess
             h, w, _ = image_array.shape
-            # image_array = cv2.resize(image_array, None, fx=3, fy=3)
-            image_array = cv2.resize(image_array, (1024, 1024))
-            image = image_array.astype(np.float32) / 255.0
+            image_array = cv2.resize(image_array, None, fx=3, fy=3)
+            # image_array = cv2.resize(image_array, (1024, 1024))
+            image = image_array.astype(np.float32) - np.array([123, 117, 104], dtype=np.float32)
             # now pixel values are scaled to [0, 1] range
             image = np.expand_dims(image, 0)
             # prediction
-            predictions = self.sess.run(self.prediction_list, feed_dict={self.images: image})
+            prediction = self.sess.run(self.prediction, feed_dict={self.images: image})
             # extract prediction
-            num_boxes = predictions[0]['num_boxes'][0]
-            boxes = predictions[0]['boxes'][0][:num_boxes]
-            scores = predictions[0]['scores'][0][:num_boxes]
+            num_boxes = prediction['num_boxes'][0]
+            boxes = prediction['boxes'][0][:num_boxes]
+            scores = prediction['scores'][0][:num_boxes]
 
             to_keep = scores > 0.05
             boxes = boxes[to_keep]
             scores = scores[to_keep]
 
-            scaler = np.array([h, w, h, w], dtype='float32')
-            boxes = boxes * scaler
+            scalar = np.array([h, w, h, w], dtype='float32')
+            boxes = boxes * scalar
 
             predictions_list.append((n, boxes, scores))
 
@@ -258,80 +271,80 @@ class Model(object):
             os.makedirs(os.path.dirname(p), exist_ok=True)
             shutil.copy(os.path.join(IMAGES_DIR, n) + '.jpg', p)
 
-    def pretrain_val(self, args):
-        init_op = tf.global_variables_initializer()
-        self.sess.run(init_op)
+    # def pretrain_val(self, args):
+    #     init_op = tf.global_variables_initializer()
+    #     self.sess.run(init_op)
+    #
+    #     # pretraining model loading
+    #     if self.load(is_pretrain=True):
+    #         print(" [*] Load SUCCESS")
+    #     else:
+    #         assert False, " [!] Load failed..."
+    #
+    #     # source val input_pipeline
+    #     source_val_next_el = self.source_input_fn(is_training=False)
+    #     # target_val_next_el = self.target_input_fn(is_training=False)
+    #     # evaluator
+    #     evaluator = EvaluatorNumpy()
+    #
+    #     # ----- source -----
+    #     try:
+    #         source_result_dir = os.path.join(args.result_dir, args.sub_dir, 'source_on_pretrain')
+    #         source_GT_result_dir = os.path.join(args.result_dir, args.sub_dir, 'source_GT_on_pretrain')
+    #         makedirs(source_result_dir)
+    #         makedirs(source_GT_result_dir)
+    #         while tqdm(True):
+    #             images, boxes, num_boxes, filenames = self.sess.run(source_val_next_el)
+    #             feed_dict = {
+    #                 self.images: images,
+    #                 self.boxes: boxes,
+    #                 self.num_boxes: num_boxes,
+    #             }
+    #
+    #             prediction_list = self.sess.run(self.prediction_list, feed_dict=feed_dict)
+    #             output_prediction(prediction_list, boxes, num_boxes, filenames,
+    #                               source_result_dir, source_GT_result_dir)
+    #     except Exception as E:
+    #         print('finished validating source images')
+    #         print('exception: {}'.format(E))
 
-        # pretraining model loading
-        if self.load(is_pretrain=True):
-            print(" [*] Load SUCCESS")
-        else:
-            assert False, " [!] Load failed..."
-
-        # source val input_pipeline
-        source_val_next_el = self.source_input_fn(is_training=False)
-        # target_val_next_el = self.target_input_fn(is_training=False)
-        # evaluator
-        evaluator = EvaluatorNumpy()
-
-        # ----- source -----
-        try:
-            source_result_dir = os.path.join(args.result_dir, args.sub_dir, 'source_on_pretrain')
-            source_GT_result_dir = os.path.join(args.result_dir, args.sub_dir, 'source_GT_on_pretrain')
-            makedirs(source_result_dir)
-            makedirs(source_GT_result_dir)
-            while tqdm(True):
-                images, boxes, num_boxes, filenames = self.sess.run(source_val_next_el)
-                feed_dict = {
-                    self.images: images,
-                    self.boxes: boxes,
-                    self.num_boxes: num_boxes,
-                }
-
-                prediction_list = self.sess.run(self.prediction_list, feed_dict=feed_dict)
-                output_prediction(prediction_list, boxes, num_boxes, filenames,
-                                  source_result_dir, source_GT_result_dir)
-        except Exception as E:
-            print('finished validating source images')
-            print('exception: {}'.format(E))
-
-    def get_feature_maps(self, args):
-        init_op = tf.global_variables_initializer()
-        self.sess.run(init_op)
-
-        # pretraining model loading
-        if self.load(is_pretrain=True):
-            print(" [*] Load SUCCESS")
-        else:
-            assert False, " [!] Load failed..."
-
-        # source val input_pipeline
-        print('loading dataset ...')
-        source_val_next_el = self.source_input_fn(is_training=False)
-
-        # ----- source -----
-        try:
-            source_result_dir = os.path.join(args.result_dir, args.sub_dir, 'feature_npy')
-            makedirs(source_result_dir)
-
-            print('getting feature maps ...')
-            cnt = 0
-            print('')
-            while True:
-                images, boxes, num_boxes, filenames = self.sess.run(source_val_next_el)
-                feed_dict = {
-                    self.images: images,
-                    self.boxes: boxes,
-                    self.num_boxes: num_boxes,
-                }
-
-                feature_maps = self.sess.run(self.detector.get_feature_maps(), feed_dict=feed_dict)
-                output_feature_maps(feature_maps, filenames, source_result_dir)
-                cnt += 1
-                print('\r%d' % cnt, end='')
-        except Exception as E:
-            print('\nfinished saving feature_maps as npy file.')
-            print('exception: {}'.format(E))
+    # def get_feature_maps(self, args):
+    #     init_op = tf.global_variables_initializer()
+    #     self.sess.run(init_op)
+    #
+    #     # pretraining model loading
+    #     if self.load(is_pretrain=True):
+    #         print(" [*] Load SUCCESS")
+    #     else:
+    #         assert False, " [!] Load failed..."
+    #
+    #     # source val input_pipeline
+    #     print('loading dataset ...')
+    #     source_val_next_el = self.source_input_fn(is_training=False)
+    #
+    #     # ----- source -----
+    #     try:
+    #         source_result_dir = os.path.join(args.result_dir, args.sub_dir, 'feature_npy')
+    #         makedirs(source_result_dir)
+    #
+    #         print('getting feature maps ...')
+    #         cnt = 0
+    #         print('')
+    #         while True:
+    #             images, boxes, num_boxes, filenames = self.sess.run(source_val_next_el)
+    #             feed_dict = {
+    #                 self.images: images,
+    #                 self.boxes: boxes,
+    #                 self.num_boxes: num_boxes,
+    #             }
+    #
+    #             feature_maps = self.sess.run(self.detector.get_feature_maps(), feed_dict=feed_dict)
+    #             output_feature_maps(feature_maps, filenames, source_result_dir)
+    #             cnt += 1
+    #             print('\r%d' % cnt, end='')
+    #     except Exception as E:
+    #         print('\nfinished saving feature_maps as npy file.')
+    #         print('exception: {}'.format(E))
 
     def save(self, model_name=None):
         if model_name is None:
@@ -340,17 +353,9 @@ class Model(object):
         self.saver.save(self.sess, os.path.join(self.checkpoint_dir, model_name))
         print(' [*] saved model')
 
-    def load(self, is_pretrain=False, model_name=None):
+    def load(self):
         print(" [*] Reading checkpoint...")
-        if model_name is None:
-            model_name = "FaceBoxes_with_MT.model"
-
-        if is_pretrain:
-            ckpt_dir = self.pretrain_ckpt_dir
-        else:
-            ckpt_dir = self.mt_ckpt_dir
-
-        ckpt = tf.train.get_checkpoint_state(ckpt_dir)
+        ckpt = tf.train.get_checkpoint_state(self.checkpoint_dir)
         if ckpt and ckpt.model_checkpoint_path:
             self.saver.restore(self.sess, ckpt.model_checkpoint_path)
             return True
@@ -368,6 +373,32 @@ class Model(object):
                 shuffle=self.is_training, augmentation=self.is_training
             )
         return pipeline.get_init_op_and_next_el()
+
+    def save_config(self):
+        config = {
+            "gpu_num_in_train": self.gpu_num,
+
+            "dataset_path": self.dataset_path,
+            "checkpoint_dir": self.checkpoint_dir,
+            "log_dir": self.log_dir,
+            "result_dir": self.result_dir,
+
+            "batch_size": self.batch_size,
+            "image_size": self.image_size,
+            "epoch": self.epoch,
+            "lr_boundaries": self.lr_boundaries,
+            "lr_values": self.lr_values,
+            "weight_decay": self.weight_decay,
+            "l_loss_weight": self.l_loss_weight,
+            "c_loss_weight": self.c_loss_weight,
+            "ohem_params": self.ohem_params,
+            "score_threshold": self.score_threshold,
+            "iou_threshold": self.iou_threshold,
+            "max_boxes": self.max_boxes,
+        }
+
+        with open(os.path.join(self.result_dir, 'config.json'), "w") as fout:
+            json.dump(config, fout, indent=4)
 
 
 def make_cosine_similarity_matrix(feature):

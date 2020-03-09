@@ -1,15 +1,13 @@
+import argparse
 import io
+import json
+import math
 import os
+import shutil
+
 import PIL.Image
 import tensorflow as tf
-import json
-import shutil
-import random
-import math
-import argparse
 from tqdm import tqdm
-import sys
-
 
 """
 The purpose of this script is to create a set of .tfrecords files
@@ -41,19 +39,20 @@ def make_args():
     parser.add_argument('-i', '--image_dir', type=str)
     parser.add_argument('-a', '--annotations_dir', type=str)
     parser.add_argument('-o', '--output', type=str)
-    parser.add_argument('-s', '--num_shards', type=int, default=1)
+    parser.add_argument('-c', '--class_name', default='face', type=str)
     return parser.parse_args()
 
 
-def dict_to_tf_example(annotation, image_dir):
+def dict_to_tf_example(annotation, image_dir, class_name='face'):
     """Convert dict to tf.Example proto.
 
     Notice that this function normalizes the bounding
     box coordinates provided by the raw data.
 
     Arguments:
-        data: a dict.
+        annotation: a dict.
         image_dir: a string, path to the image directory.
+        class_name: a string, object class
     Returns:
         an instance of tf.Example.
     """
@@ -82,16 +81,16 @@ def dict_to_tf_example(annotation, image_dir):
         print(annotation_name, 'is without any objects!')
 
     for obj in annotation['object']:
-        a = float(obj['bndbox']['ymin'])/height
-        b = float(obj['bndbox']['xmin'])/width
-        c = float(obj['bndbox']['ymax'])/height
-        d = float(obj['bndbox']['xmax'])/width
+        a = float(obj['bndbox']['ymin']) / height
+        b = float(obj['bndbox']['xmin']) / width
+        c = float(obj['bndbox']['ymax']) / height
+        d = float(obj['bndbox']['xmax']) / width
         assert (a < c) and (b < d)
         ymin.append(a)
         xmin.append(b)
         ymax.append(c)
         xmax.append(d)
-        assert obj['name'] == 'face'
+        assert obj['name'] == class_name
 
     example = tf.train.Example(features=tf.train.Features(feature={
         'filename': _bytes_feature(image_name.encode()),
@@ -124,21 +123,15 @@ def main():
     num_examples = len(examples_list)
     print('Number of images:', num_examples)
 
-    num_shards = ARGS.num_shards
-    shard_size = math.ceil(num_examples/num_shards)
-    print('Number of images per shard:', shard_size)
-
     output_dir = ARGS.output
     shutil.rmtree(output_dir, ignore_errors=True)
-    os.mkdir(output_dir)
+    os.makedirs(output_dir)
 
     shard_id = 0
     num_examples_written = 0
     for example in tqdm(examples_list):
-
-        if num_examples_written == 0:
-            shard_path = os.path.join(output_dir, 'shard-%04d.tfrecords' % shard_id)
-            writer = tf.python_io.TFRecordWriter(shard_path)
+        shard_path = os.path.join(output_dir, 'shard-%04d.tfrecords' % shard_id)
+        writer = tf.python_io.TFRecordWriter(shard_path)
 
         path = os.path.join(annotations_dir, example)
         annotation = json.load(open(path))
@@ -146,12 +139,7 @@ def main():
         writer.write(tf_example.SerializeToString())
         num_examples_written += 1
 
-        if num_examples_written == shard_size:
-            shard_id += 1
-            num_examples_written = 0
-            writer.close()
-
-    if num_examples_written != shard_size and num_examples % num_shards != 0:
+        shard_id += 1
         writer.close()
 
     print('Result is here:', ARGS.output)

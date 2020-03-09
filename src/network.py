@@ -27,9 +27,6 @@ class FeatureExtractor:
             )
             return x
 
-        with tf.name_scope('standardize_input'):
-            x = preprocess(images)
-
         # rapidly digested convolutional layers
         params = {
             'padding': 'SAME',
@@ -38,7 +35,7 @@ class FeatureExtractor:
         }
         with slim.arg_scope([slim.conv2d], **params):
             with slim.arg_scope([slim.max_pool2d], stride=2, padding='SAME', data_format='NHWC'):
-                x = slim.conv2d(x, 24, (7, 7), stride=4, scope='conv1')
+                x = slim.conv2d(images, 24, (7, 7), stride=4, scope='conv1')
                 x = slim.max_pool2d(x, (3, 3), scope='pool1')
                 x = slim.conv2d(x, 64, (5, 5), stride=2, scope='conv2')
                 x = slim.max_pool2d(x, (3, 3), scope='pool2')
@@ -66,11 +63,6 @@ class FeatureExtractor:
 
     def get_feature_maps(self):
         return self.features
-
-
-def preprocess(images):
-    """Transform images before feeding them to the network."""
-    return (2.0 * images) - 1.0
 
 
 def inception_module(x, scope):
