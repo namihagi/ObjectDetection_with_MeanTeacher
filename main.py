@@ -14,10 +14,16 @@ parser.add_argument('--gpu_num', dest='gpu_num', type=int, default=1, help='the 
 parser.add_argument('--batch_size', dest='batch_size', type=int, default=32, help='the number of images in batch')
 parser.add_argument('--epoch', dest='epoch', type=int, default=300, help='how many times you repeat dataset')
 parser.add_argument('--image_size', dest='image_size', type=int, default=1024, help='load size of image')
+parser.add_argument('--class_name', dest='class_name', type=str, default='face', help='input class name')
 
 # dir setting
-parser.add_argument('--dataset_path', dest='dataset_path', type=str, help='path to dataset shards directory')
+parser.add_argument('--dataset_path', dest='dataset_path', type=str,
+                    help='path to dataset shards directory or a image')
 parser.add_argument('--sub_dir', dest='sub_dir', type=str, help='sub directory name')
+parser.add_argument('--output_dir', dest='output_dir', type=str, default=None,
+                    help='output directory for predictions')
+parser.add_argument('--input_image_dir', dest='input_image_dir', type=str, default=None,
+                    help='input directory for detection by feature')
 
 args = parser.parse_args()
 
@@ -39,20 +45,12 @@ def main(_):
             model.train()
         elif args.phase == 'test':
             model.test()
-
-        # if args.phase == 'pretrain':
-        #     model.pretrain()
-        # elif args.phase == 'train':
-        #     model.train()
-        # elif args.phase == 'pretrain_val':
-        #     model.pretrain_val(args)
-        # elif args.phase == 'test':
-        #     assert args.source_only_test or args.MT_test, "you should set True on either source_only_test or MT_test."
-        #     model.test(args)
-        # elif args.phase == 'get_feature_maps':
-        #     model.get_feature_maps(args)
-        # elif args.phase == 'val':
-        #     model.val(args)
+        elif args.phase == 'get_prediction_from_images':
+            model.get_prediction_from_images(args)
+        elif args.phase == 'get_feature_maps':
+            model.get_feature_maps(args)
+        elif args.phase == 'input_feature_detection':
+            model.get_prediction_from_features(args)
 
 
 if __name__ == '__main__':

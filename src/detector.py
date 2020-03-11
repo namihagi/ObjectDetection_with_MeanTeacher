@@ -8,7 +8,8 @@ from src.utils import batch_non_max_suppression, batch_decode
 
 
 class Detector:
-    def __init__(self, images, feature_extractor, anchor_generator):
+    def __init__(self, images, feature=None,
+                 feature_extractor=None, anchor_generator=None):
         """
         Arguments:
             images: a float tensor with shape [batch_size, height, width, 3],
@@ -47,7 +48,7 @@ class Detector:
                 )
                 h, w = new_h, new_w
 
-        feature_maps = self.feature_extractor(images)
+        feature_maps = self.feature_extractor(images=images, input_feature=feature)
         self.is_training = self.feature_extractor.is_training
 
         self.anchors = anchor_generator(feature_maps, image_size=(w, h))
