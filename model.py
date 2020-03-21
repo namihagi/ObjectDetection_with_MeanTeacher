@@ -54,14 +54,14 @@ class Model(object):
                 "max_negatives_per_positive": 3.0, "min_negatives_per_image": 30,
             }
         # parameters for predictions
-        self.score_threshold = 0.5
-        self.iou_threshold = 0.5
-        self.max_boxes = 200
+        self.score_threshold = args.score_threshold
+        self.iou_threshold = args.iou_threshold
+        self.max_boxes = args.max_boxes
 
         # build graph
         if self.is_training:
             self._train_model()
-        elif args.phase in ['test', 'get_feature_maps', 'get_prediction_from_images']:
+        elif args.phase in ['test_for_FDDB', 'test_for_VOC', 'get_feature_maps', 'get_prediction_from_images']:
             self._test_model()
         elif args.phase == 'input_feature_detection':
             self._input_feature_model()
@@ -231,7 +231,7 @@ class Model(object):
         # save model
         self.save()
 
-    def test(self):
+    def test_for_FDDB(self):
         if self.load():
             print(" [*] Success loading")
         else:
@@ -318,6 +318,52 @@ class Model(object):
             os.makedirs(os.path.dirname(p), exist_ok=True)
             shutil.copy(os.path.join(IMAGES_DIR, n) + '.jpg', p)
 
+    def test_for_VOC(self, args):
+        if self.load():
+            print(" [*] Success loading")
+        else:
+            print(" [*] Failed loading")
+
+        assert os.path.isdir(self.dataset_path), "{} is not directory.".format(self.dataset_path)
+        image_list = sorted(glob(os.path.join(self.dataset_path, '*.jpg')))
+        assert len(image_list), 'no jpg images in ' + self.dataset_path
+
+        assert args.output_dir is not None
+        output_dir = os.path.join(args.output_dir, 'predictions_for_voc')
+        makedirs(output_dir)
+
+        for image_path in tqdm(image_list):
+            # load image
+            image_array = cv2.imread(image_path)
+            image_array = cv2.cvtColor(image_array, cv2.COLOR_BGR2RGB)
+            # preprocess
+            h, w, _ = image_array.shape
+            # image_array = cv2.resize(image_array, None, fx=3, fy=3)
+            image_array = cv2.resize(image_array, (1024, 1024))
+            image = image_array.astype(np.float32) - np.array([123, 117, 104], dtype=np.float32)
+            image = np.expand_dims(image, 0)
+            # prediction
+            prediction = self.sess.run(self.prediction, feed_dict={self.images: image})
+            # extract prediction
+            num_boxes = prediction['num_boxes'][0]
+            boxes = prediction['boxes'][0][:num_boxes]
+            scores = prediction['scores'][0][:num_boxes]
+
+            to_keep = scores > 0.5
+            boxes = boxes[to_keep]
+            scores = scores[to_keep]
+
+            scalar = np.array([h, w, h, w], dtype='float32')
+            boxes = boxes * scalar
+
+            with open(os.path.join(output_dir, image_path.split('/')[-1].replace('.jpg', '.txt')), 'w') as fout:
+                # box order [left, top, right, bottom]
+                for box, score in zip(boxes, scores):
+                    top, left, bottom, right = box
+                    fout.write('{} {} {} {} {} {}\n'.format(
+                        'face', float(score), int(top), int(left), int(bottom), int(right)
+                    ))
+
     def get_prediction_from_images(self, args):
         if self.load():
             print(" [*] Success loading")
@@ -390,8 +436,7 @@ class Model(object):
             filename = npy_path.split('/')[-1]
             # load npy
             npy_array = np.load(npy_path).astype(np.float32)
-            assert npy_array.shape[0] == 32 and npy_array.shape[2] == 128
-            npy_array = np.expand_dims(npy_array, axis=0)
+            assert npy_array.shape[1] == 32 and npy_array.shape[3] == 128
 
             # load image
             image_path = os.path.join(args.input_image_dir, filename.replace('.npy', '.jpg'))

@@ -16,6 +16,12 @@ parser.add_argument('--epoch', dest='epoch', type=int, default=300, help='how ma
 parser.add_argument('--image_size', dest='image_size', type=int, default=1024, help='load size of image')
 parser.add_argument('--class_name', dest='class_name', type=str, default='face', help='input class name')
 
+# parameters for prediction
+parser.add_argument('--score_threshold', dest='score_threshold', type=float,
+                    default=0.05, help='get prediction whose score is larger than this')
+parser.add_argument('--iou_threshold', dest='iou_threshold', type=float, default=0.3)
+parser.add_argument('--max_boxes', dest='max_boxes', type=int, default=200, help='max predictions per a image')
+
 # dir setting
 parser.add_argument('--dataset_path', dest='dataset_path', type=str,
                     help='path to dataset shards directory or a image')
@@ -43,8 +49,10 @@ def main(_):
         model = Model(sess, args)
         if args.phase == 'train':
             model.train()
-        elif args.phase == 'test':
-            model.test()
+        elif args.phase == 'test_for_FDDB':
+            model.test_for_FDDB()
+        elif args.phase == 'test_for_VOC':
+            model.test_for_VOC(args)
         elif args.phase == 'get_prediction_from_images':
             model.get_prediction_from_images(args)
         elif args.phase == 'get_feature_maps':
