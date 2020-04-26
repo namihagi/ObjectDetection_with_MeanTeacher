@@ -90,7 +90,8 @@ def dict_to_tf_example(annotation, image_dir, class_name='face'):
         xmin.append(b)
         ymax.append(c)
         xmax.append(d)
-        assert obj['name'] == class_name
+        assert obj['name'] == class_name, \
+            "class_name: {}, object_name: {}, name: {}".format(class_name, obj['name'], image_name)
 
     example = tf.train.Example(features=tf.train.Features(feature={
         'filename': _bytes_feature(image_name.encode()),
@@ -135,7 +136,7 @@ def main():
 
         path = os.path.join(annotations_dir, example)
         annotation = json.load(open(path))
-        tf_example = dict_to_tf_example(annotation, image_dir)
+        tf_example = dict_to_tf_example(annotation=annotation, image_dir=image_dir, class_name=ARGS.class_name)
         writer.write(tf_example.SerializeToString())
         num_examples_written += 1
 
